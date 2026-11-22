@@ -1,0 +1,106 @@
+name: Render Shanghaivania (1080p60 Sharded)
+
+on:
+  workflow_dispatch:
+    inputs:
+      crf:
+        description: 'H.264 CRF quality (lower = higher quality, default 16)'
+        required: false
+        default: '16'
+      publish_release:
+        description: 'Attach final MP4 to a GitHub Release'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  render-shards:
+    name: Render Shard ${{ matrix.shard }} / 20
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Ensure Remotion Headless Chrome
+        run: npx remotion browser ensure
+
+      - name: Render video shard ${{ matrix.shard }}
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+          SHARD_TOTAL: 20
+          CRF: ${{ inputs.crf || '16' }}
+          CONCURRENCY: 4
+        run: node scripts/render_shard.mjs
+
+      - name: Upload shard artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shard-${{ matrix.shard }}
+          path: out/shards/shard_*.mp4
+          retention-days: 3
+
+  merge-final:
+    name: Stitch 20 Shards & Mux 320kbps Audio
+    needs: render-shards
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all shards
+        uses: actions/download-artifact@v4
+        with:
+          path: out/downloaded
+          pattern: shard-*
+          merge-multiple: true
+
+      - name: Install FFmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Concatenate shards & mux master Shanghaivania audio
+        run: |
+          mkdir -p out/final
+          find "$PWD/out/downloaded" -maxdepth 2 -name 'shard_*.mp4' | sort | awk '{print "file \x27" $0 "\x27"}' > out/concat.txt
+          cat out/concat.txt
+          ffmpeg -y -f concat -safe 0 -i out/concat.txt \
+            -i public/audio/shanghaivania.mp3 \
+            -map 0:v:0 -map 1:a:0 \
+            -c:v copy -c:a aac -b:a 320k \
+            -shortest -movflags +faststart \
+            out/final/ink-sans-shanghaivania-1080p60.mp4
+          ffprobe -v error -show_format -show_streams out/final/ink-sans-shanghaivania-1080p60.mp4
+          ls -lh out/final/ink-sans-shanghaivania-1080p60.mp4
+
+      - name: Upload final 1080p60 MP4 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ink-sans-shanghaivania-1080p60
+          path: out/final/ink-sans-shanghaivania-1080p60.mp4
+          retention-days: 30
+
+      - name: Publish GitHub Release with final MP4
+        if: ${{ inputs.publish_release != false }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="render-${{ github.run_number }}"
+          gh release create "$TAG" out/final/ink-sans-shanghaivania-1080p60.mp4 \
+            --title "Ink!Sans Fight — Shanghaivania (1080p60 #${{ github.run_number }})" \
+            --notes "Full-length 3:44.7 1920x1080 @ 60fps Remotion + Three.js + GLSL animation synced to Valor Genesect - Shanghaivania (190 BPM)."
